@@ -216,8 +216,9 @@ typedef enum {
 } dt_liquify_node_type_enum_t;
 
 typedef enum {
-  DT_LIQUIFY_STATUS_NONE     = 0,
-  DT_LIQUIFY_STATUS_CREATING = 1,
+  DT_LIQUIFY_STATUS_NONE         = 0,
+  DT_LIQUIFY_STATUS_CREATING     = 1,
+  DT_LIQUIFY_STATUS_INTERPOLATED = 2,
   DT_LIQUIFY_STATUS_LAST
 } dt_liquify_status_enum_t;
 
@@ -226,6 +227,7 @@ typedef enum {
  */
 
 typedef enum {
+  DT_LIQUIFY_STRUCT_TYPE_NONE       =  0,
   DT_LIQUIFY_WARP_V1                =  1,
   DT_LIQUIFY_WARPS                  =  1,
   DT_LIQUIFY_PATH_END_PATH_V1       =  2,
@@ -1376,6 +1378,8 @@ static void build_round_stamp (float complex **pstamp,
   // 0.5 is factored in so the warp starts to degenerate when the
   // strength arrow crosses the warp radius.
   double complex strength = 0.5 * (warp->strength - warp->point);
+  strength = (warp->header.status & DT_LIQUIFY_STATUS_INTERPOLATED) ?
+    (strength * STAMP_RELOCATION) : strength;
   double abs_strength = cabs (strength);
 
   PERF_START ();
@@ -1597,28 +1601,44 @@ static void apply_global_distortion_map (struct dt_iop_module_t *module,
   PERF_STOP ("distortion map applied");
 }
 
-static gpointer _get_prev (GList *path, dt_liquify_struct_enum_t type)
+static gpointer _get_prev_except (GList *path, dt_liquify_struct_enum_t type, dt_liquify_struct_enum_t except_type)
 {
   path = path->prev;
   while (path && path->data)
   {
-    if (((dt_liquify_data_union_t *) path->data)->header.type & type)
+    dt_liquify_data_union_t *d = (dt_liquify_data_union_t *) path->data;
+    if (d->header.type & except_type)
+      return NULL;
+    if (d->header.type & type)
       return path->data;
     path = path->prev;
   }
   return NULL;
 }
 
-static gpointer _get_next (GList *path, dt_liquify_struct_enum_t type)
+static gpointer _get_next_except (GList *path, dt_liquify_struct_enum_t type, dt_liquify_struct_enum_t except_type)
 {
   path = path->next;
   while (path && path->data)
   {
-    if (((dt_liquify_data_union_t *) path->data)->header.type & type)
+    dt_liquify_data_union_t *d = (dt_liquify_data_union_t *) path->data;
+    if (d->header.type & except_type)
+      return NULL;
+    if (d->header.type & type)
       return path->data;
     path = path->next;
   }
   return NULL;
+}
+
+static gpointer _get_prev (GList *path, dt_liquify_struct_enum_t type)
+{
+  return _get_prev_except (path, type, DT_LIQUIFY_STRUCT_TYPE_NONE);
+}
+
+static gpointer _get_next (GList *path, dt_liquify_struct_enum_t type)
+{
+  return _get_next_except (path, type, DT_LIQUIFY_STRUCT_TYPE_NONE);
 }
 
 static double complex * _get_point (GList *path)
@@ -2306,6 +2326,7 @@ static void update_warp_count (dt_iop_liquify_gui_data_t *g)
 static GList *interpolate_paths (GList *paths)
 {
   GList *l = NULL;
+  int warps = 0;
 
   for (GList *j = paths; j != NULL; j = j->next)
   {
@@ -2313,17 +2334,23 @@ static GList *interpolate_paths (GList *paths)
 
     if (data->header.type == DT_LIQUIFY_WARP_V1)
     {
+      warps++;
       continue;
     }
 
     if (data->header.type == DT_LIQUIFY_PATH_END_PATH_V1)
     {
-      dt_liquify_warp_v1_t *warp = _get_prev (j, DT_LIQUIFY_WARP_V1);
-      assert (warp);
-      dt_liquify_warp_v1_t *w = malloc (sizeof (dt_liquify_warp_v1_t));
-      memcpy (w, warp, sizeof (dt_liquify_warp_v1_t));
-      debug_warp (w);
-      l = g_list_append (l, w);
+      if (warps == 1)
+      {
+        // lone warp
+        dt_liquify_warp_v1_t *warp = _get_prev (j, DT_LIQUIFY_WARP_V1);
+        assert (warp);
+        dt_liquify_warp_v1_t *w = malloc (sizeof (dt_liquify_warp_v1_t));
+        memcpy (w, warp, sizeof (dt_liquify_warp_v1_t));
+        debug_warp (w);
+        l = g_list_append (l, w);
+      }
+      warps = 0;
       continue;
     }
 
@@ -2344,7 +2371,7 @@ static GList *interpolate_paths (GList *paths)
         double t = arc_length / total_length;
         double complex pt = cmix (*p1, *p2, t);
         mix_warps (w, warp1, warp2, pt, t);
-        w->strength = cmix (w->point, w->strength, STAMP_RELOCATION);
+        w->header.status = DT_LIQUIFY_STATUS_INTERPOLATED;
         arc_length += cabs (w->radius - w->point) * STAMP_RELOCATION;
         l = g_list_append (l, w);
       }
@@ -2375,7 +2402,7 @@ static GList *interpolate_paths (GList *paths)
         dt_liquify_warp_v1_t *w = malloc (sizeof (dt_liquify_warp_v1_t));
         double complex pt = point_at_arc_length (buffer, INTERPOLATION_POINTS, arc_length, &restart);
         mix_warps (w, warp1, warp2, pt, arc_length / total_length);
-        w->strength = cmix (w->point, w->strength, STAMP_RELOCATION);
+        w->header.status = DT_LIQUIFY_STATUS_INTERPOLATED;
         arc_length += cabs (w->radius - w->point) * STAMP_RELOCATION;
         l = g_list_append (l, w);
       }
@@ -3031,7 +3058,7 @@ static void solve_linsys (size_t n,
   free (d);
 }
 
-void setup_linsys (GQueue *warp_stack, GQueue * curve_stack)
+void setup_linsys (GQueue *warp_stack, GQueue *curve_stack)
 {
   // one string of connected curves
 
@@ -3063,14 +3090,14 @@ void setup_linsys (GQueue *warp_stack, GQueue * curve_stack)
   }
 
   // 2. decide which equation to use (the brainy part)
-  for (int i = 0; i < nc; i++)
+  for (int i = 0; i < nw - 1; i++)
   {
     bool autosmooth      = ((dt_liquify_warp_v1_t *) g_queue_peek_nth (warp_stack, i))
       ->node_type == DT_LIQUIFY_NODE_TYPE_AUTOSMOOTH;
     bool next_autosmooth = ((dt_liquify_warp_v1_t *) g_queue_peek_nth (warp_stack, i + 1))
       ->node_type == DT_LIQUIFY_NODE_TYPE_AUTOSMOOTH;
     bool firstseg        = i == 0;
-    bool lastseg         = i == nc - 1;
+    bool lastseg         = i == nw - 2;
 
     // Program the linear system with equations:
     //
@@ -3136,11 +3163,6 @@ void setup_linsys (GQueue *warp_stack, GQueue * curve_stack)
 
   solve_linsys (nw, pt, c1, c2, eqn);
 
-  // free stacks
-  while (g_queue_pop_head (warp_stack))
-    ;
-  while (g_queue_pop_head (curve_stack))
-    ;
   free (pt);
   free (c1);
   free (c2);
@@ -3167,10 +3189,10 @@ static void smooth_paths_linsys (dt_iop_liquify_gui_data_t *g)
     case DT_LIQUIFY_PATH_LINE_TO_V1:
     case DT_LIQUIFY_PATH_END_PATH_V1:
     case DT_LIQUIFY_PATH_CLOSE_PATH_V1:
-      setup_linsys (warp_stack, curve_stack);
-      break;
     default:
       setup_linsys (warp_stack, curve_stack);
+      g_queue_clear (warp_stack);
+      g_queue_clear (curve_stack);
       break;
     }
   }
@@ -3339,15 +3361,26 @@ static GList *delete_node (GList *paths, gconstpointer data)
   GList *link = g_list_find (paths, data);
   if (!link)
     return paths;
-  gconstpointer prev = _get_prev (link, DT_LIQUIFY_PATH_MOVES);
+  gconstpointer prev = _get_prev_except (link, DT_LIQUIFY_PATH_MOVES, DT_LIQUIFY_PATH_ENDS);
+
   if (prev)
+    // this is not the first node in path, delete preceding move
     paths = g_list_remove (paths, prev);
   else
   {
-    gconstpointer next = _get_next (link, DT_LIQUIFY_PATH_MOVES);
+    gconstpointer next = _get_next_except (link, DT_LIQUIFY_PATH_MOVES, DT_LIQUIFY_PATH_ENDS);
     if (next)
+      // this is the first but not the last node in path, delete next move
       paths = g_list_remove (paths, next);
+    else
+    {
+      // this is the first and last node in path, delete end_path
+      next = _get_next (link, DT_LIQUIFY_PATH_ENDS);
+      paths = g_list_remove (paths, next);
+    }
   }
+
+  // delete this node
   paths = g_list_remove (paths, data);
   return paths;
 }
@@ -3989,39 +4022,57 @@ int button_released (struct dt_iop_module_t *module,
       {
         dt_liquify_data_union_t *e = g->last_hit.elem;
         GList *link = g_list_find (g->paths, e);
-        if (link && link->prev && e->header.type  == DT_LIQUIFY_PATH_CURVE_TO_V1)
+        GList *list = g_list_first (link);
+        if (link && e->header.type == DT_LIQUIFY_PATH_LINE_TO_V1)
         {
-	  PRINT ("Add node to curve.\n");
-          dt_liquify_curve_to_v1_t *c = (dt_liquify_curve_to_v1_t *) g->last_hit.elem;
-          double complex p0 = *_get_point (link->prev);
-          double complex p1 = c->ctrl1;
-          double complex p2 = c->ctrl2;
-          double complex p3 = e->warp.point;
-          double t = find_nearest_on_curve_t (p0, p1, p2, p3, pt, INTERPOLATION_POINTS);
-          casteljau (&p0, &c->ctrl1, &c->ctrl2, &e->warp.point, t);
-          casteljau (&p3, &p2, &p1, &p0, 1.0 - t);
-          dt_liquify_warp_v1_t *tmp_warp  = alloc_warp (p3, DT_LIQUIFY_STATUS_NONE, scale);
-          dt_liquify_curve_to_v1_t *tmp_curve = alloc_curve_to (DT_LIQUIFY_STATUS_NONE);
-          *tmp_warp = e->warp;
-          tmp_curve->ctrl1 = p1;
-          tmp_curve->ctrl2 = p2;
-          link = g_list_insert_before (g_list_first (link), link->next, tmp_warp);
-          link = g_list_insert_before (g_list_first (link), link->next, tmp_curve);
+          // warp1 -> line1 -> warp3
+          //          ^ link
+	  PRINT ("Add node to line.\n");
+          dt_liquify_warp_v1_t *warp1 = _get_prev (link, DT_LIQUIFY_WARP_V1);
+          dt_liquify_warp_v1_t *warp3 = _get_next (link, DT_LIQUIFY_WARP_V1);
+          assert (warp1);
+          assert (warp3);
+          dt_liquify_line_to_v1_t *line2 = alloc_line_to (DT_LIQUIFY_STATUS_NONE);
+          dt_liquify_warp_v1_t    *warp2 = alloc_warp (0, DT_LIQUIFY_STATUS_NONE, scale);
+
+          double t = find_nearest_on_line_t (warp1->point, warp3->point, pt);
+          double complex midpoint = cmix (warp1->point, warp3->point, t);
+
+          mix_warps (warp2, warp1, warp3, midpoint, t);
+
+          // warp1 -> line1 -> warp2 -> line2 -> warp3
+          list = g_list_insert_before (list, link->next, line2);
+          list = g_list_insert_before (list, link->next, warp2);
 
           handled = 2;
           goto done;
         }
-        if (link && link->prev && e->header.type  == DT_LIQUIFY_PATH_LINE_TO_V1)
+        if (link && e->header.type == DT_LIQUIFY_PATH_CURVE_TO_V1)
         {
-	  PRINT ("Add node to line.\n");
-          double complex p0 = *_get_point (link->prev);
-          double complex p1 = e->warp.point;
-          double t = find_nearest_on_line_t (p0, p1, pt);
-          dt_liquify_warp_v1_t *tmp_warp = alloc_warp (mix (p0, p1, t), DT_LIQUIFY_STATUS_NONE, scale);
-          dt_liquify_line_to_v1_t *tmp_line  = alloc_line_to (DT_LIQUIFY_STATUS_NONE);
-          *tmp_warp = e->warp;
-          link = g_list_insert_before (g_list_first (link), link->next, tmp_warp);
-          link = g_list_insert_before (g_list_first (link), link->next, tmp_line);
+          // warp1 -> curve1 -> warp3
+          //          ^ link
+	  PRINT ("Add node to curve.\n");
+          dt_liquify_curve_to_v1_t *curve1 = (dt_liquify_curve_to_v1_t *) e;
+          dt_liquify_warp_v1_t *warp1  = _get_prev (link, DT_LIQUIFY_WARP_V1);
+          dt_liquify_warp_v1_t *warp3  = _get_next (link, DT_LIQUIFY_WARP_V1);
+          assert (warp1);
+          assert (warp3);
+          dt_liquify_curve_to_v1_t *curve2 = alloc_curve_to (DT_LIQUIFY_STATUS_NONE);
+          *curve2 = *curve1;
+          dt_liquify_warp_v1_t     *warp2  = alloc_warp (0, DT_LIQUIFY_STATUS_NONE, scale);
+
+          double t = find_nearest_on_curve_t (warp1->point, curve1->ctrl1, curve1->ctrl2, warp3->point,
+                                              pt, INTERPOLATION_POINTS);
+          double complex midpoint = warp3->point;
+          casteljau (&warp1->point, &curve1->ctrl1, &curve1->ctrl2, &midpoint, t);
+          midpoint = warp1->point;
+          casteljau (&warp3->point, &curve2->ctrl2, &curve2->ctrl1, &midpoint, 1.0 - t);
+
+          mix_warps (warp2, warp1, warp3, midpoint, t);
+
+          // warp1 -> curve1 -> warp2 -> curve2 -> warp3
+          list = g_list_insert_before (list, link->next, curve2);
+          list = g_list_insert_before (list, link->next, warp2);
 
           handled = 2;
           goto done;
